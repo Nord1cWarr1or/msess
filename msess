@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# msess — быстрый выборщик сессий MiMoCode (fzf)
+#
+# Глобальный список всех сессий: fuzzy-поиск по заголовкам, полнотекстовый
+# поиск по содержимому переписок (FTS5), preview последних сообщений,
+# открытие сессии в текущем терминале, переименование и удаление.
+#
+# Спека: docs/superpowers/specs/2026-08-30-msess-design.md
+# Данные: SQLite mimocode.db (read-only, кроме rename) + CLI-фолбэк
+
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+export PYTHONIOENCODING=utf-8
+
+DEFAULT_DB="${MIMOCODE_HOME:-$HOME/.local/share/mimocode}/mimocode.db"
+DB=""
+DB_OK=1
+
+die() { echo "msess: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+msess — быстрый выборщик сессий MiMoCode (fzf)
+
+Внутри fzf:
+  Enter    открыть выбранную сессию в текущем терминале
+  Ctrl-R   переименовать сессию
+  Ctrl-D   удалить сессию (подтверждение)
+  Ctrl-T   режим: заголовки ⇄ поиск по содержимому
+  Esc      выход
+
+Окружение:
+  MIMOCODE_DB    путь к mimocode.db (по умолчанию — автоопределение)
+EOF
+}
+
+# ---------------------------------------------------------------- зависимости
+
+version_gte() { # $1 = факт, $2 = минимум (dotted)
+  python3 - "$1" "$2" <<'PY'
+import sys
+a = [int(x) for x in sys.argv[1].split(".")]
+b = [int(x) for x in sys.argv[2].split(".")]
+a += [0] * (len(b) - len(a)); b += [0] * (len(a) - len(b))
+sys.exit(0 if a >= b else 1)
+PY
+}
+
+check_deps() {
+  command -v python3 >/dev/null 2>&1 || die "python3 не найден"
+  command -v mimo >/dev/null 2>&1 || die "mimo не найден"
+  command -v fzf >/dev/null 2>&1 || die "fzf не найден"
+  local v
+  v="$(fzf --version 2>/dev/null | awk '{print $1}')"
+  [[ -n "$v" ]] || die "не удалось определить версию fzf"
+  version_gte "$v" 0.36 || die "нужен fzf >= 0.36, установлен $v"
+}
+
+resolve_db() { # приоритет: MIMOCODE_DB → дефолт (учитывает MIMOCODE_HOME) → mimo db path.
+  # mimo db path — последний фолбэк: спавн бинарника ~1с, недопустим на каждый reload
+  if [[ -n "${MIMOCODE_DB:-}" && -f "$MIMOCODE_DB" ]]; then
+    DB="$MIMOCODE_DB"
+  elif [[ -f "$DEFAULT_DB" ]]; then
+    DB="$DEFAULT_DB"
+  else
+    DB="$(mimo db path 2>/dev/null | head -n1)"
+    [[ -n "$DB" && -f "$DB" ]] || DB="$DEFAULT_DB"
+  fi
+  [[ -f "$DB" && -r "$DB" ]] || DB_OK=0
+}
+
+# ------------------------------------------------------------------- данные
+
+sanitize_query() { # stdout: слова запроса, каждое в "..." (нейтрализация спецсимволов FTS5)
+  python3 - "${1:-}" <<'PY'
+import sys
+words = []
+for w in sys.argv[1].split():
+    if not any(ord(c) < 32 for c in w):
+        w = w.replace('"', "")
+        if any(c.isalnum() for c in w):  # выбрасываем чисто-пунктуационные слова
+            words.append(f'"{w}"')
+print(" ".join(words))
+PY
+}
+
+rows_title() { # TSV: display \t id; источник — БД (CLI фильтрует часть сессий), фолбэк — CLI
+  if (( DB_OK == 1 )); then
+    python3 - "$DB" <<'PY' && return 0
+import sys, sqlite3, datetime, os
+home = os.path.expanduser("~")
+today = datetime.date.today()
+
+def clean(s): return " ".join(str(s).split())
+
+def humd(ts):
+    d = datetime.date.fromtimestamp(int(ts) / 1000)
+    if d == today:
+        return datetime.datetime.fromtimestamp(int(ts) / 1000).strftime("%H:%M")
+    return f"{d.month}/{d.day}".ljust(5)
+
+def short(p):
+    p = str(p)
+    if p.startswith(home):
+        p = "~" + p[len(home):]
+    if len(p) > 26:
+        p = p[:12] + "…" + p[-12:]
+    return p.ljust(26)
+
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5)
+try:
+    rows = con.execute(
+        """SELECT id, title, time_updated, directory
+             FROM session WHERE parent_id IS NULL
+            ORDER BY time_updated DESC""").fetchall()
+except sqlite3.Error:
+    sys.exit(1)  # падаем в CLI-фолбэк
+if not rows:
+    print("нет сессий\t"); sys.exit(0)
+for r in rows:
+    print(f'{humd(r[2])}  {short(r[3])}  {clean(r[1])}\t{r[0]}')
+PY
+  fi
+  local json
+  if ! json="$(mimo session list --format json -n 1000 2>/dev/null)"; then
+    printf '⚠ список сессий недоступен — Esc для выхода\t\n'
+    return 0
+  fi
+  python3 - "$json" <<'PY'
+import json, sys, datetime, os
+home = os.path.expanduser("~")
+today = datetime.date.today()
+
+def clean(s): return " ".join(str(s).split())
+
+def humd(ts):
+    d = datetime.date.fromtimestamp(int(ts) / 1000)
+    if d == today:
+        return datetime.datetime.fromtimestamp(int(ts) / 1000).strftime("%H:%M")
+    return f"{d.month}/{d.day}".ljust(5)
+
+def short(p):
+    p = str(p)
+    if p.startswith(home):
+        p = "~" + p[len(home):]
+    if len(p) > 26:
+        p = p[:12] + "…" + p[-12:]
+    return p.ljust(26)
+
+rows = json.loads(sys.argv[1])
+if not rows:
+    print("нет сессий\t")
+    sys.exit(0)
+rows.sort(key=lambda s: s.get("updated", 0), reverse=True)
+for s in rows:
+    print(f'{humd(s["updated"])}  {short(s["directory"])}  {clean(s["title"])}\t{s["id"]}')
+PY
+}
+
+rows_content() { # $1 = запрос; TSV: display \t id
+  local q="${1:-}" fq
+  if (( DB_OK == 0 )); then
+    printf '⚠ база недоступна (%s) — поиск по содержимому выключен\t\n' "$DB"
+    return 0
+  fi
+  fq="$(sanitize_query "$q")"
+  if [[ -z "$fq" ]]; then rows_title; return 0; fi
+  python3 - "$DB" "$fq" <<'PY'
+import sys, sqlite3, datetime, os
+db, fq = sys.argv[1], sys.argv[2]
+home = os.path.expanduser("~")
+today = datetime.date.today()
+
+def clean(s): return " ".join(str(s).split())
+
+def humd(ts):
+    d = datetime.date.fromtimestamp(int(ts) / 1000)
+    if d == today:
+        return datetime.datetime.fromtimestamp(int(ts) / 1000).strftime("%H:%M")
+    return f"{d.month}/{d.day}".ljust(5)
+
+SQL = """
+SELECT s.id AS id, s.title AS title, s.time_updated AS upd,
+       snippet(history_fts_idx, 0, '▶', '◀', '…', 10) AS frag
+  FROM history_fts_idx
+  JOIN history_fts h ON h.rowid = history_fts_idx.rowid
+  JOIN session s ON s.id = h.session_id
+ WHERE history_fts_idx MATCH ?
+   AND h.kind IN ('user_text','assistant_text')
+ ORDER BY s.time_updated DESC LIMIT 200"""
+try:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    rs = con.execute(SQL, (fq,)).fetchall()
+except sqlite3.Error as e:
+    print(f"⚠ SQLite: {e}\t")
+    sys.exit(0)
+for r in rs:
+    frag = clean(r["frag"]).replace("▶", "\x1b[91m").replace("◀", "\x1b[0m")
+    print(f'{humd(r["upd"])}  {clean(r["title"])}  {frag}\t{r["id"]}')
+PY
+}
+
+preview_session() { # $1 = id сессии, $2 = запрос (опционально)
+  # Правая панель делится по вертикали: «начало» — верхняя половина, ровно
+  # на середине — горизонтальная черта, под ней «последние» и совпадения,
+  # растущие вниз (при переполнении остаётся хвост — новейшее у нижней рамки).
+  # Строки переносим сами (fzf без :wrap) — 1 строка вывода = 1 строка панели.
+  local id="${1:-}" q="${2:-}" fq
+  if (( DB_OK == 0 )); then
+    printf 'база недоступна\n'
+    return 0
+  fi
+  fq="$(sanitize_query "$q")"
+  python3 - "$DB" "$id" "$fq" <<'PY'
+import sys, os, re, sqlite3, json
+db, sid, fq = sys.argv[1], sys.argv[2], sys.argv[3]
+H = int(os.environ.get("FZF_PREVIEW_LINES") or 45)    # высота панели (fzf 0.74)
+W = int(os.environ.get("FZF_PREVIEW_COLUMNS") or 96)  # ширина панели
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+try:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+except sqlite3.Error as e:
+    print(f"SQLite: {e}"); sys.exit(0)
+
+def text_of(mid):
+    p = con.execute(
+        """SELECT data FROM part
+            WHERE message_id=? AND json_extract(data,'$.type')='text'
+            ORDER BY id LIMIT 1""", (mid,)).fetchone()
+    if not p:
+        return ""
+    try:
+        return json.loads(p["data"]).get("text", "") or ""
+    except Exception:
+        return ""
+
+def wrap(role, text):
+    """Жёсткий перенос по ширине панели: строки гарантированно ≤ W символов."""
+    fp = f"{role:>6} │ "
+    cp = "      ↳ "
+    limit = max(12, W - len(fp))
+    words = text.split()
+    if not words:
+        return [fp]
+    lines, cur = [], ""
+    for w in words:
+        if not cur:
+            cur = w
+        elif len(cur) + 1 + len(w) <= limit:
+            cur += " " + w
+        else:
+            lines.append((fp if not lines else cp) + cur)
+            cur = w
+    lines.append((fp if not lines else cp) + cur)
+    return lines
+
+def add_messages(out, rows, budget):
+    for m in rows:
+        if len(out) >= budget:
+            return
+        for ln in wrap(str(m["role"] or "?")[:6], " ".join(text_of(m["id"]).split())):
+            if len(out) >= budget:
+                return
+            out.append(ln)
+
+MSG_Q = """SELECT id, json_extract(data,'$.role') AS role
+             FROM message WHERE session_id=?"""
+total = con.execute("SELECT COUNT(*) FROM message WHERE session_id=?", (sid,)).fetchone()[0]
+
+sep_at = H // 2                    # строка-разделитель между половинами
+top_max = sep_at
+bot_max = H - sep_at - 1           # одна строка ушла на черту
+sep = "\x1b[90m" + "─" * W + "\x1b[0m"  # серая линия через всю панель
+# ── верхняя половина: начало сессии (или все сообщения короткой сессии)
+top = []
+if total == 0:
+    top.append("нет сообщений")
+else:
+    top.append(f"── начало (всего {total} сообщений) ──" if total > 15
+               else f"── сообщения ({total}) ──")
+    add_messages(top, con.execute(MSG_Q + " ORDER BY time_created ASC, id ASC LIMIT 25",
+                                  (sid,)).fetchall(), top_max)
+
+# ── нижняя половина: начинается сразу под чертой, растёт вниз;
+#    новейшие сообщения и совпадения — в конце блока (у нижней рамки)
+matches = []
+if fq:
+    try:
+        frags = con.execute(
+            """SELECT snippet(history_fts_idx, 0, '▶', '◀', '…', 12) AS frag
+                 FROM history_fts_idx
+                 JOIN history_fts h ON h.rowid = history_fts_idx.rowid
+                WHERE history_fts_idx MATCH ? AND h.session_id=?
+                  AND h.kind IN ('user_text','assistant_text')
+                ORDER BY h.time_created DESC LIMIT 10""", (fq, sid)).fetchall()
+    except sqlite3.Error:
+        frags = []
+    for r in frags:
+        frag = " ".join(r["frag"].split())
+        matches.append(("      · " + frag[: W - 9])
+                       .replace("▶", "\x1b[91m").replace("◀", "\x1b[0m"))
+
+bottom = []
+if total > 15:  # короткая сессия целиком показана вверху
+    bottom.append("── последние ──")
+    avail = bot_max - len(bottom) - len(matches)
+    blocks, used = [], 0
+    for m in con.execute(MSG_Q + " ORDER BY time_created DESC, id DESC LIMIT 25", (sid,)):
+        lines = wrap(str(m["role"] or "?")[:6], " ".join(text_of(m["id"]).split()))
+        if used + len(lines) > avail:
+            break
+        blocks.append(lines)
+        used += len(lines)
+    for b in reversed(blocks):
+        bottom.extend(b)
+bottom.extend(matches)
+bottom = bottom[-bot_max:]  # при переполнении сохраняем хвост — новейшее снизу
+
+pad = max(0, top_max - len(top))
+print("\n".join(top[:top_max] + [""] * pad + [sep] + bottom))
+PY
+}
+
+# ----------------------------------------------------------------- действия
+
+do_rename() { # $1 = id; единственная прямая запись в БД
+  local id="$1" cur nt
+  (( DB_OK == 1 )) || { echo "база недоступна — переименование невозможно"; sleep 1; return 0; }
+  cur="$(python3 - "$DB" "$id" <<'PY'
+import sys, sqlite3
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5)
+r = con.execute("SELECT title FROM session WHERE id=?", (sys.argv[2],)).fetchone()
+print(r[0] if r else "")
+PY
+)"
+  [[ -n "$cur" ]] || { echo "msess: сессия не найдена"; sleep 1; return 0; }
+  if ! read -e -r -i "$cur" -p "Новое название: " nt; then echo; return 0; fi
+  nt="${nt//$'\t'/ }"
+  [[ -z "$nt" || "$nt" == "$cur" ]] && return 0
+  python3 - "$DB" "$id" "$nt" <<'PY'
+import sys, sqlite3
+con = sqlite3.connect(sys.argv[1], timeout=5)
+con.execute("UPDATE session SET title=? WHERE id=?", (sys.argv[3], sys.argv[2]))
+con.commit()
+PY
+  echo "переименовано ✓"
+  sleep 0.4
+}
+
+do_delete() { # $1 = id; удаление только через официальный CLI
+  local id="$1" a
+  if ! read -n1 -r -p "Удалить сессию? [y/N] " a; then echo; return 0; fi
+  echo
+  [[ "$a" == y || "$a" == Y ]] || return 0
+  if ! mimo session delete "$id" >/dev/null 2>&1; then
+    echo "msess: не удалось удалить сессию"; sleep 1; return 0
+  fi
+  echo "удалено ✓"
+  sleep 0.4
+}
+
+# --------------------------------------------------------------------- fzf
+
+run_fzf() { # $1 = режим, $2 = запрос; stdout: key\nquery\nselection-line
+  local mode="$1" q="$2" label
+  if [[ "$mode" == "title" ]]; then
+    label="ctrl-t — поиск по содержимому"
+  else
+    label="ctrl-t — заголовки"
+  fi
+  local -a common=(
+    --delimiter=$'\t'
+    --with-nth=1
+    --nth=1
+    --ansi --no-sort --reverse
+    --print-query
+    --expect='ctrl-r,ctrl-d,ctrl-t,esc'
+    --preview="$SELF __preview {2} {q}"
+    --preview-window=right:50%
+    --header="enter — открыть · ctrl-r — переименовать · ctrl-d — удалить · esc — выход · $label"
+    --query="$q"
+  )
+  if [[ "$mode" == "title" ]]; then
+    rows_title | fzf "${common[@]}" --prompt='сессии> '
+  else
+    rows_content "$q" | fzf "${common[@]}" --disabled --prompt='fts> ' \
+      --bind="change:reload($SELF __rows content {q})"
+  fi
+}
+
+main() {
+  case "${1:-}" in
+    __rows)
+      shift
+      resolve_db
+      if [[ "${1:-}" == "content" ]]; then shift; rows_content "${1:-}"; else rows_title; fi
+      return 0
+      ;;
+    __preview)
+      shift
+      resolve_db
+      preview_session "${1:-}" "${2:-}"
+      return 0
+      ;;
+    -h|--help)
+      usage
+      return 0
+      ;;
+    *) : ;;  # неизвестный аргумент — обычный запуск пикера
+  esac
+
+  check_deps
+  resolve_db
+  # preflight: hard-путь недоступного источника (спека §6)
+  if (( DB_OK == 1 )); then
+    python3 - "$DB" <<'PY' || die "база недоступна: $DB"
+import sys, sqlite3
+sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5).execute("SELECT 1")
+PY
+  else
+    mimo session list --format json -n 2 >/dev/null 2>&1 || die "ни база ($DB), ни CLI недоступны"
+  fi
+
+  local MODE=title Q="" key sel out st
+  while true; do
+    out="$(run_fzf "$MODE" "$Q")"
+    st=$?
+    (( st == 0 )) || break  # Ctrl-C (130) или аварийный выход
+    # fzf 0.74 печатает query → key → selection; определяем key по набору expect-клавиш
+    l1="$(printf '%s\n' "$out" | sed -n 1p)"
+    l2="$(printf '%s\n' "$out" | sed -n 2p)"
+    case "$l1" in
+      ctrl-t|ctrl-r|ctrl-d|esc) key="$l1"; Q="$l2" ;;
+      *) Q="$l1"; key="$l2" ;;
+    esac
+    sel="$(printf '%s\n' "$out" | sed -n 3p | cut -f2)"
+    case "$key" in
+      esc) break ;;
+      ctrl-t) if [[ "$MODE" == "title" ]]; then MODE=content; else MODE=title; fi ;;
+      ctrl-r) if [[ -n "$sel" ]] && do_rename "$sel"; then Q=""; fi ;;
+      ctrl-d) if [[ -n "$sel" ]] && do_delete "$sel"; then Q=""; fi ;;
+      *) [[ -n "$sel" ]] && exec mimo -s "$sel" ;;
+    esac
+  done
+  return 0
+}
+
+main "$@"
