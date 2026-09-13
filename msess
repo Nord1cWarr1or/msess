@@ -80,7 +80,7 @@ resolve_db() { # приоритет: MIMOCODE_DB → дефолт (учитыв�
 
 load_state() { # восстанавливает MODE/DIR_MODE из файла состояния; нет файла/битый — дефолты
   [[ -r "$STATE_FILE" ]] || return 0
-  local kv
+  local kv=""  # init обязателен: read на каталоге падает, не присвоив kv, а set -u убьёт скрипт
   while IFS= read -r kv || [[ -n "$kv" ]]; do
     case "$kv" in
       mode=title) MODE=title ;;
@@ -98,6 +98,8 @@ save_state() { # атомарная запись состояния (tmp+mv); be
   tmp="$STATE_FILE.$$"
   if printf 'mode=%s\ndir=%s\n' "$MODE" "$DIR_MODE" > "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"  # не осталять обрезанный tmp (диск полон и т.п.)
   fi
 }
 
