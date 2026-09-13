@@ -3,7 +3,8 @@
 #
 # Глобальный список всех сессий: fuzzy-поиск по заголовкам, полнотекстовый
 # поиск по содержимому переписок (FTS5), preview последних сообщений,
-# открытие сессии в текущем терминале, переименование и удаление.
+# открытие сессии в текущем терминале (текущая или сохранённая папка, Ctrl-F),
+# переименование и удаление.
 #
 # Спека: docs/superpowers/specs/2026-08-30-msess-design.md
 # Данные: SQLite mimocode.db (read-only, кроме rename) + CLI-фолбэк
@@ -16,6 +17,7 @@ export PYTHONIOENCODING=utf-8
 DEFAULT_DB="${MIMOCODE_HOME:-$HOME/.local/share/mimocode}/mimocode.db"
 DB=""
 DB_OK=1
+DIR_MODE=0  # 0 — открывать в текущей папке, 1 — в сохранённой папке сессии (тумблер Ctrl-F)
 
 die() { echo "msess: $*" >&2; exit 1; }
 
@@ -28,6 +30,7 @@ msess — быстрый выборщик сессий MiMoCode (fzf)
   Ctrl-R   переименовать сессию
   Ctrl-D   удалить сессию (подтверждение)
   Ctrl-T   режим: заголовки ⇄ поиск по содержимому
+  Ctrl-F   папка открытия: текущая ⇄ сохранённая папка сессии
   Esc      выход
 
 Окружение:
@@ -363,25 +366,93 @@ do_delete() { # $1 = id; удаление только через официал
   sleep 0.4
 }
 
+do_open() { # $1 = id; открывает сессию (папка — по DIR_MODE), запоминает новую папку в БД
+  local id="$1" dir=""
+  if (( DB_OK == 1 )); then
+    dir="$(python3 - "$DB" "$id" <<'PY'
+import sys, sqlite3
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5)
+r = con.execute("SELECT directory FROM session WHERE id=?", (sys.argv[2],)).fetchone()
+print(r[0] if r and r[0] else "")
+PY
+)"
+  fi
+  # DIR_MODE=1 — идём в сохранённую папку (если она есть на диске), иначе открываем здесь
+  if [[ "$DIR_MODE" == 1 && -n "$dir" && -d "$dir" ]]; then
+    cd "$dir" || :  # папка исчезла между проверкой и cd — открываем в текущей
+  fi
+  # открыли не там, где сессия была в прошлый раз → запоминаем новую папку
+  if (( DB_OK == 1 )) && [[ "$PWD" != "$dir" ]]; then
+    python3 - "$DB" "$id" "$PWD" 2>/dev/null <<'PY'
+import sys, sqlite3
+try:
+    con = sqlite3.connect(sys.argv[1], timeout=5)
+    con.execute("UPDATE session SET directory=? WHERE id=?", (sys.argv[3], sys.argv[2]))
+    con.commit()
+except sqlite3.Error:
+    pass  # открытие важнее записи
+PY
+  fi
+  exec mimo -s "$id"
+}
+
 # --------------------------------------------------------------------- fzf
 
+wrap_header() { # $1 = текст (фразы через " · "), $2 = ширина области; stdout: перенесённый заголовок
+  # fzf не переносит header сам — на узком окне строку обрезает; укладываем
+  # фразы («клавиша — действие») в несколько строк жадным переносом.
+  local rest="$1" width="$2" phrase line="" out=""
+  while [[ -n "$rest" ]]; do
+    if [[ "$rest" == *" · "* ]]; then
+      phrase="${rest%% · *}"
+      rest="${rest#* · }"
+    else
+      phrase="$rest"
+      rest=""
+    fi
+    if [[ -z "$line" ]]; then
+      line="$phrase"
+    elif (( ${#line} + 3 + ${#phrase} <= width )); then
+      line+=" · $phrase"
+    else
+      out+="$line"$'\n'
+      line="$phrase"
+    fi
+  done
+  printf '%s' "$out$line"
+}
+
 run_fzf() { # $1 = режим, $2 = запрос; stdout: key\nquery\nselection-line
-  local mode="$1" q="$2" label
+  local mode="$1" q="$2" label dlabel
   if [[ "$mode" == "title" ]]; then
     label="ctrl-t — поиск по содержимому"
   else
     label="ctrl-t — заголовки"
   fi
+  if [[ "$DIR_MODE" == 1 ]]; then
+    dlabel="ctrl-f — папка: сессии"
+  else
+    dlabel="ctrl-f — папка: текущая"
+  fi
+  # Область списка — левая половина экрана (preview занимает right:50%);
+  # шапку переносим по фразам под эту ширину.
+  local header="enter — открыть · ctrl-r — переименовать · ctrl-d — удалить · esc — выход · $label · $dlabel"
+  local cols avail
+  cols="$(tput cols < /dev/tty 2>/dev/null || true)"
+  [[ -n "$cols" ]] || cols=120
+  avail=$(( (cols + 1) / 2 ))
+  (( avail < 32 )) && avail=32
+  header="$(wrap_header "$header" "$avail")"
   local -a common=(
     --delimiter=$'\t'
     --with-nth=1
     --nth=1
     --ansi --no-sort --reverse
     --print-query
-    --expect='ctrl-r,ctrl-d,ctrl-t,esc'
+    --expect='ctrl-f,ctrl-r,ctrl-d,ctrl-t,esc'
     --preview="$SELF __preview {2} {q}"
     --preview-window=right:50%
-    --header="enter — открыть · ctrl-r — переименовать · ctrl-d — удалить · esc — выход · $label"
+    --header="$header"
     --query="$q"
   )
   if [[ "$mode" == "title" ]]; then
@@ -434,16 +505,17 @@ PY
     l1="$(printf '%s\n' "$out" | sed -n 1p)"
     l2="$(printf '%s\n' "$out" | sed -n 2p)"
     case "$l1" in
-      ctrl-t|ctrl-r|ctrl-d|esc) key="$l1"; Q="$l2" ;;
+      ctrl-f|ctrl-t|ctrl-r|ctrl-d|esc) key="$l1"; Q="$l2" ;;
       *) Q="$l1"; key="$l2" ;;
     esac
     sel="$(printf '%s\n' "$out" | sed -n 3p | cut -f2)"
     case "$key" in
       esc) break ;;
+      ctrl-f) if [[ "$DIR_MODE" == 1 ]]; then DIR_MODE=0; else DIR_MODE=1; fi ;;
       ctrl-t) if [[ "$MODE" == "title" ]]; then MODE=content; else MODE=title; fi ;;
       ctrl-r) if [[ -n "$sel" ]] && do_rename "$sel"; then Q=""; fi ;;
       ctrl-d) if [[ -n "$sel" ]] && do_delete "$sel"; then Q=""; fi ;;
-      *) [[ -n "$sel" ]] && exec mimo -s "$sel" ;;
+      *) [[ -n "$sel" ]] && do_open "$sel" ;;
     esac
   done
   return 0
