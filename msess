@@ -15,8 +15,10 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 export PYTHONIOENCODING=utf-8
 
 DEFAULT_DB="${MIMOCODE_HOME:-$HOME/.local/share/mimocode}/mimocode.db"
+STATE_FILE="${MSESS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/msess/state}"
 DB=""
 DB_OK=1
+MODE=title  # title|content — режим списка, восстанавливается из файла состояния
 DIR_MODE=0  # 0 — открывать в текущей папке, 1 — в сохранённой папке сессии (тумблер Ctrl-F)
 
 die() { echo "msess: $*" >&2; exit 1; }
@@ -35,6 +37,7 @@ msess — быстрый выборщик сессий MiMoCode (fzf)
 
 Окружение:
   MIMOCODE_DB    путь к mimocode.db (по умолчанию — автоопределение)
+  MSESS_STATE    файл состояния (режимы поиска и папки открытия)
 EOF
 }
 
@@ -71,6 +74,31 @@ resolve_db() { # приоритет: MIMOCODE_DB → дефолт (учитыв�
     [[ -n "$DB" && -f "$DB" ]] || DB="$DEFAULT_DB"
   fi
   [[ -f "$DB" && -r "$DB" ]] || DB_OK=0
+}
+
+# --------------------------------------------------------------- состояние
+
+load_state() { # восстанавливает MODE/DIR_MODE из файла состояния; нет файла/битый — дефолты
+  [[ -r "$STATE_FILE" ]] || return 0
+  local kv
+  while IFS= read -r kv || [[ -n "$kv" ]]; do
+    case "$kv" in
+      mode=title) MODE=title ;;
+      mode=content) MODE=content ;;
+      dir=0) DIR_MODE=0 ;;
+      dir=1) DIR_MODE=1 ;;
+    esac
+  done < "$STATE_FILE"
+}
+
+save_state() { # атомарная запись состояния (tmp+mv); best-effort — сбои молча
+  local dir tmp
+  dir="$(dirname "$STATE_FILE")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  tmp="$STATE_FILE.$$"
+  if printf 'mode=%s\ndir=%s\n' "$MODE" "$DIR_MODE" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp"
+  fi
 }
 
 # ------------------------------------------------------------------- данные
@@ -341,7 +369,8 @@ print(r[0] if r else "")
 PY
 )"
   [[ -n "$cur" ]] || { echo "msess: сессия не найдена"; sleep 1; return 0; }
-  if ! read -e -r -i "$cur" -p "Новое название: " nt; then echo; return 0; fi
+  # stdin внутри fzf execute — /dev/null, поэтому read ходит прямо в терминал
+  if ! read -e -r -i "$cur" -p "Новое название: " nt < /dev/tty; then echo; return 0; fi
   nt="${nt//$'\t'/ }"
   [[ -z "$nt" || "$nt" == "$cur" ]] && return 0
   python3 - "$DB" "$id" "$nt" <<'PY'
@@ -356,7 +385,7 @@ PY
 
 do_delete() { # $1 = id; удаление только через официальный CLI
   local id="$1" a
-  if ! read -n1 -r -p "Удалить сессию? [y/N] " a; then echo; return 0; fi
+  if ! read -n1 -r -p "Удалить сессию? [y/N] " a < /dev/tty; then echo; return 0; fi
   echo
   [[ "$a" == y || "$a" == Y ]] || return 0
   if ! mimo session delete "$id" >/dev/null 2>&1; then
@@ -449,17 +478,25 @@ run_fzf() { # $1 = режим, $2 = запрос; stdout: key\nquery\nselection-
     --nth=1
     --ansi --no-sort --reverse
     --print-query
-    --expect='ctrl-f,ctrl-r,ctrl-d,ctrl-t,esc'
+    --expect='ctrl-f,ctrl-t,esc'
     --preview="$SELF __preview {2} {q}"
     --preview-window=right:50%
     --header="$header"
     --query="$q"
   )
+  # ctrl-r/ctrl-d исполняются внутри fzf (execute) со своей перезагрузкой
+  # списка: пикер не закрывается, курсор (reload держит индекс) и запрос
+  # сохраняются
   if [[ "$mode" == "title" ]]; then
-    rows_title | fzf "${common[@]}" --prompt='сессии> '
+    rows_title | fzf "${common[@]}" \
+      --bind="ctrl-r:execute($SELF __rename {2})+reload($SELF __rows)" \
+      --bind="ctrl-d:execute($SELF __delete {2})+reload($SELF __rows)" \
+      --prompt='сессии> '
   else
     rows_content "$q" | fzf "${common[@]}" --disabled --prompt='fts> ' \
-      --bind="change:reload($SELF __rows content {q})"
+      --bind="change:reload($SELF __rows content {q})" \
+      --bind="ctrl-r:execute($SELF __rename {2})+reload($SELF __rows content {q})" \
+      --bind="ctrl-d:execute($SELF __delete {2})+reload($SELF __rows content {q})"
   fi
 }
 
@@ -477,6 +514,17 @@ main() {
       preview_session "${1:-}" "${2:-}"
       return 0
       ;;
+    __rename)
+      shift
+      resolve_db
+      [[ -n "${1:-}" ]] && do_rename "$1"
+      return 0
+      ;;
+    __delete)
+      shift
+      [[ -n "${1:-}" ]] && do_delete "$1"
+      return 0
+      ;;
     -h|--help)
       usage
       return 0
@@ -486,6 +534,7 @@ main() {
 
   check_deps
   resolve_db
+  load_state
   # preflight: hard-путь недоступного источника (спека §6)
   if (( DB_OK == 1 )); then
     python3 - "$DB" <<'PY' || die "база недоступна: $DB"
@@ -496,7 +545,7 @@ PY
     mimo session list --format json -n 2 >/dev/null 2>&1 || die "ни база ($DB), ни CLI недоступны"
   fi
 
-  local MODE=title Q="" key sel out st
+  local Q="" key sel out st
   while true; do
     out="$(run_fzf "$MODE" "$Q")"
     st=$?
@@ -505,16 +554,14 @@ PY
     l1="$(printf '%s\n' "$out" | sed -n 1p)"
     l2="$(printf '%s\n' "$out" | sed -n 2p)"
     case "$l1" in
-      ctrl-f|ctrl-t|ctrl-r|ctrl-d|esc) key="$l1"; Q="$l2" ;;
+      ctrl-f|ctrl-t|esc) key="$l1"; Q="$l2" ;;
       *) Q="$l1"; key="$l2" ;;
     esac
     sel="$(printf '%s\n' "$out" | sed -n 3p | cut -f2)"
     case "$key" in
       esc) break ;;
-      ctrl-f) if [[ "$DIR_MODE" == 1 ]]; then DIR_MODE=0; else DIR_MODE=1; fi ;;
-      ctrl-t) if [[ "$MODE" == "title" ]]; then MODE=content; else MODE=title; fi ;;
-      ctrl-r) if [[ -n "$sel" ]] && do_rename "$sel"; then Q=""; fi ;;
-      ctrl-d) if [[ -n "$sel" ]] && do_delete "$sel"; then Q=""; fi ;;
+      ctrl-f) if [[ "$DIR_MODE" == 1 ]]; then DIR_MODE=0; else DIR_MODE=1; fi; save_state ;;
+      ctrl-t) if [[ "$MODE" == "title" ]]; then MODE=content; else MODE=title; fi; save_state ;;
       *) [[ -n "$sel" ]] && do_open "$sel" ;;
     esac
   done
