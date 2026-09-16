@@ -30,9 +30,10 @@ msess — быстрый выборщик сессий MiMoCode (fzf)
 Внутри fzf:
   Enter    открыть выбранную сессию в текущем терминале
   Ctrl-R   переименовать сессию
-  Ctrl-D   удалить сессию (подтверждение)
+  Ctrl-D   удалить отмеченные сессии (Enter — подтвердить)
   Ctrl-T   режим: заголовки ⇄ поиск по содержимому
   Ctrl-F   папка открытия: текущая ⇄ сохранённая папка сессии
+  Tab      отметить сессию для группового удаления
   Esc      выход
 
 Окружение:
@@ -385,20 +386,36 @@ PY
   sleep 0.4
 }
 
-do_delete() { # $1 = id; удаление только через официальный CLI
-  local id="$1" a
-  if ! read -n1 -r -p "Удалить сессию? [y/N] " a < /dev/tty; then echo; return 0; fi
-  echo
-  [[ "$a" == y || "$a" == Y ]] || return 0
-  if ! mimo session delete "$id" >/dev/null 2>&1; then
-    echo "msess: не удалось удалить сессию"; sleep 1; return 0
+do_delete() { # $@ = id...; подтверждение по Enter, удаление через официальный CLI
+  local n=$# a id
+  (( n > 0 )) || return 0
+  if (( n == 1 )); then
+    read -n1 -r -p "Удалить сессию? [Enter — да · n — отмена] " a < /dev/tty || { echo; return 0; }
+  else
+    read -n1 -r -p "Удалить сессии (${n} шт.)? [Enter — да · n — отмена] " a < /dev/tty || { echo; return 0; }
   fi
+  echo
+  [[ -z "$a" || "$a" == y || "$a" == Y ]] || return 0
+  for id in "$@"; do
+    mimo session delete "$id" >/dev/null 2>&1 || echo "msess: не удалось удалить $id"
+  done
   echo "удалено ✓"
   sleep 0.4
 }
 
+do_toggle() { # $1 = search|dir; флип режима + запись файла (вызывается биндами fzf)
+  load_state
+  case "${1:-}" in
+    search) if [[ "$MODE" == "content" ]]; then MODE=title; else MODE=content; fi ;;
+    dir) if [[ "$DIR_MODE" == 1 ]]; then DIR_MODE=0; else DIR_MODE=1; fi ;;
+    *) return 0 ;;
+  esac
+  save_state
+}
+
 do_open() { # $1 = id; открывает сессию (папка — по DIR_MODE), запоминает новую папку в БД
   local id="$1" dir=""
+  load_state  # ctrl-f переворачивал режим внутри fzf — актуальный в файле состояния
   if (( DB_OK == 1 )); then
     dir="$(python3 - "$DB" "$id" <<'PY'
 import sys, sqlite3
@@ -453,12 +470,18 @@ wrap_header() { # $1 = текст (фразы через " · "), $2 = шири�
   printf '%s' "$out$line"
 }
 
-run_fzf() { # $1 = режим, $2 = запрос; stdout: key\nquery\nselection-line
-  local mode="$1" q="$2" label dlabel
-  if [[ "$mode" == "title" ]]; then
-    label="ctrl-t — поиск по содержимому"
-  else
+print_prompt() { # stdout: промпт по режиму из файла состояния (для transform-prompt)
+  load_state
+  if [[ "$MODE" == "content" ]]; then printf 'fts> '; else printf 'сессии> '; fi
+}
+
+print_header() { # stdout: шапка подсказок по режиму (для --header и transform-header)
+  load_state
+  local label dlabel
+  if [[ "$MODE" == "content" ]]; then
     label="ctrl-t — заголовки"
+  else
+    label="ctrl-t — поиск по содержимому"
   fi
   if [[ "$DIR_MODE" == 1 ]]; then
     dlabel="ctrl-f — папка: сессии"
@@ -467,39 +490,42 @@ run_fzf() { # $1 = режим, $2 = запрос; stdout: key\nquery\nselection-
   fi
   # Область списка — левая половина экрана (preview занимает right:50%);
   # шапку переносим по фразам под эту ширину.
-  local header="enter — открыть · ctrl-r — переименовать · ctrl-d — удалить · esc — выход · $label · $dlabel"
   local cols avail
   cols="$(tput cols < /dev/tty 2>/dev/null || true)"
   [[ -n "$cols" ]] || cols=120
   avail=$(( (cols + 1) / 2 ))
   (( avail < 32 )) && avail=32
-  header="$(wrap_header "$header" "$avail")"
+  wrap_header "enter — открыть · ctrl-r — переименовать · ctrl-d — удалить · tab — отметить · $label · $dlabel · esc — выход" "$avail"
+}
+
+run_fzf() { # один fzf на оба режима; все действия — in-place, позиция и запрос не сбрасываются
   local -a common=(
     --delimiter=$'\t'
     --with-nth=1
     --nth=1
     --ansi --no-sort --reverse
-    --print-query
-    --expect='ctrl-f,ctrl-t,esc'
+    --multi
     --preview="$SELF __preview {2} {q}"
     --preview-window=right:50%
-    --header="$header"
-    --query="$q"
+    --header="$("$SELF" __header)"
+    # список перечитывается по мере набора; в режиме заголовков источник
+    # игнорирует запрос — фильтрует сам fzf
+    --bind="change:reload($SELF __rows auto {q})"
+    # ctrl-t/ctrl-f/ctrl-r/ctrl-d исполняются внутри fzf: пикер не закрывается,
+    # reload держит курсор на месте
+    --bind="ctrl-t:execute-silent($SELF __toggle search)+reload($SELF __rows auto {q})+toggle-search+transform-prompt($SELF __prompt)+transform-header($SELF __header)"
+    --bind="ctrl-f:execute-silent($SELF __toggle dir)+transform-header($SELF __header)"
+    --bind="ctrl-r:execute($SELF __rename {2})+reload($SELF __rows auto {q})"
+    --bind="ctrl-d:execute($SELF __delete {+2})+reload($SELF __rows auto {q})"
   )
-  # ctrl-r/ctrl-d исполняются внутри fzf (execute) со своей перезагрузкой
-  # списка: пикер не закрывается, курсор (reload держит индекс) и запрос
-  # сохраняются
-  if [[ "$mode" == "title" ]]; then
-    rows_title | fzf "${common[@]}" \
-      --bind="ctrl-r:execute($SELF __rename {2})+reload($SELF __rows)" \
-      --bind="ctrl-d:execute($SELF __delete {2})+reload($SELF __rows)" \
-      --prompt='сессии> '
+  # начальные флаги и источник — по режиму из файла состояния
+  local -a initial=()
+  if [[ "$MODE" == "content" ]]; then
+    initial=(--disabled --prompt='fts> ')
   else
-    rows_content "$q" | fzf "${common[@]}" --disabled --prompt='fts> ' \
-      --bind="change:reload($SELF __rows content {q})" \
-      --bind="ctrl-r:execute($SELF __rename {2})+reload($SELF __rows content {q})" \
-      --bind="ctrl-d:execute($SELF __delete {2})+reload($SELF __rows content {q})"
+    initial=(--prompt='сессии> ')
   fi
+  rows_title | fzf "${common[@]}" "${initial[@]}"
 }
 
 main() {
@@ -507,13 +533,34 @@ main() {
     __rows)
       shift
       resolve_db
-      if [[ "${1:-}" == "content" ]]; then shift; rows_content "${1:-}"; else rows_title; fi
+      case "${1:-}" in
+        content) shift; rows_content "${1:-}" ;;
+        auto)
+          shift
+          load_state
+          if [[ "$MODE" == "content" ]]; then rows_content "${1:-}"; else rows_title; fi
+          ;;
+        *) rows_title ;;
+      esac
       return 0
       ;;
     __preview)
       shift
       resolve_db
       preview_session "${1:-}" "${2:-}"
+      return 0
+      ;;
+    __toggle)
+      shift
+      do_toggle "${1:-}"
+      return 0
+      ;;
+    __prompt)
+      print_prompt
+      return 0
+      ;;
+    __header)
+      print_header
       return 0
       ;;
     __rename)
@@ -524,7 +571,7 @@ main() {
       ;;
     __delete)
       shift
-      [[ -n "${1:-}" ]] && do_delete "$1"
+      [[ -n "${1:-}" ]] && do_delete "$@"  # {+2} передаёт все отмеченные id
       return 0
       ;;
     -h|--help)
@@ -547,25 +594,16 @@ PY
     mimo session list --format json -n 2 >/dev/null 2>&1 || die "ни база ($DB), ни CLI недоступны"
   fi
 
-  local Q="" key sel out st
+  local out st sel
+  # fzf живёт в одном процессе: все действия (toggle/rename/delete) — in-place
+  # бинды; наружу выходят только Enter (exec mimo) и Esc/Ctrl-C
   while true; do
-    out="$(run_fzf "$MODE" "$Q")"
+    out="$(run_fzf)"
     st=$?
-    (( st == 0 )) || break  # Ctrl-C (130) или аварийный выход
-    # fzf 0.74 печатает query → key → selection; определяем key по набору expect-клавиш
-    l1="$(printf '%s\n' "$out" | sed -n 1p)"
-    l2="$(printf '%s\n' "$out" | sed -n 2p)"
-    case "$l1" in
-      ctrl-f|ctrl-t|esc) key="$l1"; Q="$l2" ;;
-      *) Q="$l1"; key="$l2" ;;
-    esac
-    sel="$(printf '%s\n' "$out" | sed -n 3p | cut -f2)"
-    case "$key" in
-      esc) break ;;
-      ctrl-f) if [[ "$DIR_MODE" == 1 ]]; then DIR_MODE=0; else DIR_MODE=1; fi; save_state ;;
-      ctrl-t) if [[ "$MODE" == "title" ]]; then MODE=content; else MODE=title; fi; save_state ;;
-      *) [[ -n "$sel" ]] && do_open "$sel" ;;
-    esac
+    (( st == 0 )) || break
+    # при --multi элемент под курсором идёт последним в выводе
+    sel="$(printf '%s\n' "$out" | tail -n1 | cut -f2)"
+    [[ -n "$sel" ]] && do_open "$sel"
   done
   return 0
 }
