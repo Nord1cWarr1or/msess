@@ -6,7 +6,6 @@
 # открытие сессии в текущем терминале (текущая или сохранённая папка, Ctrl-F),
 # переименование и удаление.
 #
-# Спека: docs/superpowers/specs/2026-08-30-msess-design.md
 # Данные: SQLite mimocode.db (read-only, кроме rename) + CLI-фолбэк
 
 set -uo pipefail
