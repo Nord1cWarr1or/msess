@@ -113,7 +113,12 @@ for w in sys.argv[1].split():
     if not any(ord(c) < 32 for c in w):
         w = w.replace('"', "")
         if any(c.isalnum() for c in w):  # выбрасываем чисто-пунктуационные слова
-            words.append(f'"{w}"')
+            if w.endswith("*"):  # префиксный поиск: * должен быть СНАРУЖИ кавычек
+                stem = w.rstrip("*")
+                if any(c.isalnum() for c in stem):
+                    words.append(f'"{stem}"*')
+            else:
+                words.append(f'"{w}"')
 print(" ".join(words))
 PY
 }
@@ -220,7 +225,7 @@ SELECT s.id AS id, s.title AS title, s.time_updated AS upd,
   JOIN history_fts h ON h.rowid = history_fts_idx.rowid
   JOIN session s ON s.id = h.session_id
  WHERE history_fts_idx MATCH ?
-   AND h.kind IN ('user_text','assistant_text')
+   AND h.tool_name IS NULL
  ORDER BY s.time_updated DESC LIMIT 200"""
 try:
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
@@ -328,7 +333,7 @@ if fq:
                  FROM history_fts_idx
                  JOIN history_fts h ON h.rowid = history_fts_idx.rowid
                 WHERE history_fts_idx MATCH ? AND h.session_id=?
-                  AND h.kind IN ('user_text','assistant_text')
+                  AND h.tool_name IS NULL
                 ORDER BY h.time_created DESC LIMIT 10""", (fq, sid)).fetchall()
     except sqlite3.Error:
         frags = []
